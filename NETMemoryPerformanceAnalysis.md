@@ -1190,13 +1190,19 @@ flowchart TB
 
 從 GC 的角度，它透過各種 runtime 元件得知哪些 object 應存活。它不關心這些 object 的類型，只關心存活的 memory 量及這些 object 是否有引用（需追蹤這些引用以觸及應存活的子 object ）。我們持續改進 GC 本身以縮短暫停，但作為撰寫 managed code 的開發者，了解 object 存活的機制是改善 GC 暫停的重要途徑。
 
-###### 1. 分代機制
+##### 1. 分代機制
 
 我們已討論過分代 GC 的影響，因此第一條規則是：
 
 `當某個 generation 未被收集時，表示該 generation 中的所有 object 均假定存活中`
 
-因此，若收集 gen2（Full GC），分代機制無關緊要——因為所有 generation 都會被收集。常見問題是：「我已多次呼叫 `GC.Collect()`，為何 object 仍存在？」這是因為當你強制 Full Blocking GC 時，GC 不參與決定哪些 object 應存活——它僅透過 [user roots](#2-User-roots)（stack 變數、GC handles、finalize queue 等，後續討論）得知。
+因此，若收集 gen2（Full GC），分代機制無關緊要——因為所有 generation 都會被收集。
+
+常見問題是：「我已多次呼叫 `GC.Collect()`，為何 object 仍存在？」這要先理解 GC 的工作原理：GC 本身沒有「這個 object 太舊了，應該清掉」這類判斷邏輯。它唯一做的事是從一組起點——稱為 [user roots](#2-User-roots)（stack 變數、GC handles、finalize queue 等）——出發，沿著引用鏈一路標記。凡是能從任何 root 觸及到的 object，GC 就認定它存活、不能回收；反之，沒有任何 root 能觸及到的 object 才會被回收。
+
+因此，即使你呼叫 Full Blocking GC（gen2 收集），只要程式中仍有 root（例如某個 stack 變數、static 欄位、event handler）在引用某個 object——或者引用鏈上的某個中間 object——該 object 就永遠不會被回收，`GC.Collect()` 調用多少次都一樣。問題不在 GC，而在你的程式仍握著對該 object 的引用。
+
+可以把 GC 想像成清潔人員，roots 是門禁卡：清潔人員只能進入有門禁卡的房間（root 指向的 object），進去後把裡面連通的房間全部保留；沒有任何門禁卡能到達的房間才會被清掉。你再喊「再掃一次！」也沒用——門禁卡還插著，房間就永遠清不掉。
 
 ```C#
 public void Example()
@@ -1230,46 +1236,51 @@ public void Example()
 
 **分代 GC 機制對效能優化的實際影響：**
 
-.NET GC 的分代機制雖然是其核心設計，但在實際效能分析和優化過程中，這個機制的重要影響常常被工具和開發者所忽視。
+回顧前一節提到的分代規則：當只做 gen0 GC 時，gen1 和 gen2 中的 object 不會被掃描，它們直接被假定為存活。這帶來一個關鍵後果 —— 如果 gen2 中有某個 object 引用了 gen0 中的 object，那個 gen0 object 在 gen0 GC 期間就無法被回收（因為 GC 無法區分「被 gen2 引用」和「被其他 gen0 引用」，它只知道這個 gen0 object 有來自外部的引用）。這種情況稱為**跨代引用（cross-generation references）**。
 
-大多數效能分析工具僅提供 heap dump，這些工具通常只會顯示哪些 stack 變數和 GC handles 持有 object 引用，以及整體 memory 使用情況。然而它們很少展示**跨代引用（cross-generation references）**如何影響 GC 行為。
+`.NET GC` 的分代機制雖然是其核心設計，但在實際效能分析和優化中，跨代引用的影響常被工具和開發者忽視。大多數效能分析工具僅提供 heap dump，只顯示哪些 stack 變數和 GC handles 持有 object 引用，以及整體 memory 使用情況，但很少展示跨代引用如何影響 GC 行為。
 
-一個常見的優化誤區：假設你發現應用程式有 GC 暫停問題，分析後移除了大量 GC handle（這些 handle 多半指向 gen2 的 object），期望減少 GC 暫停時間。但結果 GC 暫停幾乎沒有改善——為什麼？
+一個常見的優化誤區：假設你發現應用程式有 GC 暫停問題，透過工具分析後看到大量 GC handle 指向 gen2 中的 object，便花費精力移除這些 handle，期望減少 GC 暫停。但結果暫停幾乎沒有改善——為什麼？
 
-如果應用程式中大部分 GC 暫停來自 **gen0 GC** 而非 gen2 GC，且 gen2 中有其他 object 仍在引用 gen0 的 object（跨代引用），這些 gen0 object 在 gen0 GC 時就必須保持存活。你移除的那些 gen2 object 如果並非持有 gen0 object 的那些，gen0 中的 object 仍然會被其他 gen2 object 引用 → gen0 GC 的工作量和暫停時間不會減少。
+答案通常出在兩點：
+1. 大部分 GC 暫停實際上來自 **gen0 GC**（而非 gen2 GC）。gen0 GC 的觸發頻率遠高於 gen2，因此即使每次 gen0 暫停時間短，累積起來仍可能佔總暫停時間的大半。
+2. gen2 中「其他 object」仍在引用 gen0 中的 object（跨代引用），這些 gen0 object 在每次 gen0 GC 時都必須保持存活、被標記、被掃描。你移除的那些 gen2 object 若並非持有 gen0 object 的「關鍵引用者」，則 gen0 中仍有大量 object 被其他 gen2 object 引用——gen0 GC 的工作量和暫停時間不會因此減少。
 
-有限的效益：即使你真的減少了 gen2 的大小和工作量，**如果 gen2 GC 很少被觸發（相對於 gen0/gen1 GC），對整體效能的影響極小**——gen0/gen1 GC 的暫停時間仍然存在，且可能占總 GC 暫停時間的大部分。
+同樣地，即使你確實減少了 gen2 的大小和工作量，若 **gen2 GC 很少被觸發**（相對於 gen0 / gen1 GC），對整體效能的影響也極微——因為 gen0 / gen1 GC 的暫停仍然存在，且可能佔總暫停時間的絕大部分。
 
 **有效的 GC 優化需要：**
-- 先確定**哪一代**的 GC 造成了主要的效能問題
-- 理解不同代之間的引用關係，特別是**高代對低代的引用**
-- 針對性優化：減少 gen0 GC 暫停 → 處理高代到 gen0 的引用；減少 gen2 GC 次數 → 減少升入 gen2 的 object 數量
+- 先確定**哪一代**的 GC 造成了主要的效能問題（是大量頻繁的 gen0 GC？還是偶發但耗時的 gen2 GC？）
+- 理解不同代之間的引用關係，特別注意**高代對低代的引用**（因為這些引用會讓低代 object 在高頻 GC 中無法被回收）
+- 針對性優化：若主力是 gen0 GC 暫停 → 處理 gen2/gen1 指向 gen0 的跨代引用；若主力是 gen2 GC → 減少一路存活併升入 gen2 的 object 數量
 - 使用能顯示分代關係和跨代引用的分析工具
 
-###### 2. 用戶根 (User roots)
+##### 2. 用戶根 (User roots)
 
 你可能聽過的常見 root 類型包括指向 object 的 stack 變數、 GC handles 和 finalize queue。我稱之為 user roots，因它們源自 user code。由於這些是 user code 可直接影響的部分，將詳細討論。
 
 - Stack 變數
 
-Stack 變數（尤其是 C# 程式）較少被討論，因 JIT 能有效判斷 stack 變數何時不再使用。方法結束時， stack root 必定消失。甚至在方法結束前， JIT 能判斷 stack 變數是否仍需使用，因此即使方法中途發生 GC， JIT 不會將這個變數告訴 GC 作為 root（當變數不被視為 root 時，其指向的 object 就可能被回收）。注意： DEBUG 版本不適用此情況。
+Stack 變數是許多人最直覺能想到的 root 類型——你在方法裡 `new` 一個 object 並賦值給局部變數，這個局部變數就是一個 stack root。但有一個容易被忽略的細節：**JIT 會在編譯時分析每個變數的「最後使用點」，一旦某個變數在後續程式碼中不再被讀取，JIT 就不再向 GC 報告它為 root**——即使方法還沒結束。這意味著該變數指向的 object 可能在方法中途的某次 GC 就被回收，而不必等到方法返回。
+
+例如在 Release 模式下編譯以下程式碼：
 
 ```C#
 public class DetailedExample
 {
     public void Example ()
     {
-        // Release 模式
-        var obj1 = new object ();
-        var obj2 = new object ();
-        
+        var obj1 = new object ();   // obj1 是 stack root，指向 Heap 上的新 object
+        var obj2 = new object ();   // obj2 也是 stack root
+
         DoWork (obj1);
-        // JIT 知道 obj1 後面不會再用到
-        // 如果這時發生 GC：
-        // - obj1 不會被報告為 root（可以被回收）
-        // - obj2 還會被報告為 root（後面還會用到）
-        
+        // ↑ DoWork 是最後一次使用 obj1 的地方
+        // JIT 知道 obj1 之後不再被讀取，因此從這行之後：
+        // - 若此時觸發 GC，JIT 不會將 obj1 回報為 root
+        // - obj1 指向的 object 就可能被回收（即使 Example 方法還沒返回）
+        // - obj2 仍會被回報為 root（因為後面 DoWork(obj2) 還需要它）
+
         DoWork (obj2);
+        // ↑ 方法結束前，obj2 的 stack root 也會消失
     }
     
     public async Task AsyncExample ()
@@ -1277,126 +1288,278 @@ public class DetailedExample
         var data = new byte[1000];
         await Task.Delay (100);
         
-        // 在 async 方法中
-        // 變數生命週期管理更複雜
-        // JIT 可能需要保持更多 root 存活
+        // 在 async 方法中，方法被編譯為狀態機（state machine）
+        // await 之後的變數可能被提升為狀態機的欄位（field）
+        // 這使得變數的生命週期比同步方法更難預測
+        // JIT 可能需要保持更多 root 存活，直到整個非同步流程結束
     }
 }
 ```
 
+> **注意：以上行為僅限 Release 模式。** Debug 模式下，JIT 會刻意延長所有局部變數的生命週期到方法結束，確保你在偵錯時可以隨時查看任何變數的值。因此，在 Debug 模式下觀察到的 object 存活行為與正式環境（Release）可能完全不同。
+
 - GC handles​​
 
-GC handles 是 user code 持有 object 存活或檢查 object 而不持有存活的方式。前者稱為 strong handle，後者稱為 weak handle。 Strong handles 需釋放才能不再持有 object 存活（即需呼叫 handle 的 Free）。有人展示 !gcroot (顯示 object  root 的 SoS 除錯器指) 輸出，指出 strong handle 指向 object 並詢問為何 GC 未回收。設計上，此 handle 告知 GC 該 object 需存活，因此 GC 無法回收。目前以下 [user exposed handle types](https://docs.microsoft.com/en-us/dotnet/api/system.runtime.interopservices.gchandletype?view=netcore-3.1) 為 strong handles： Strong 和 Pinned； weak handles 為 Weak 和 WeakTrackResurrection。但若看過 SoS 的 !gchandles 輸出， pinned handles 可能包含 AsyncPinned。
+GC handles 是 .NET 提供的一組 API（`System.Runtime.InteropServices.GCHandle`），讓 user code 能明確地控制 object 的存活狀態。依用途分為兩大類：
 
-###### 釘選 (Pinning)
+- **Strong handle**（`GCHandleType.Strong`、`GCHandleType.Pinned`）：你告訴 GC「這個 object 我要用，請保留它」。只要 strong handle 未被釋放（呼叫 `Free()`），GC 就絕不會回收它指向的 object。這是新手常遇到的困惑點：用 SoS 除錯器的 `!gcroot` 指令看到某個 strong handle 指向一個 object，納悶為何 GC 不回收——答案很簡單，設計上 strong handle 的存在就是在命令 GC「這個 object 必須存活」，GC 沒有選擇權。
 
-在 .NET 的垃圾收集系統中， pinning 是標記物件不可移動的機制。從 GC 效能角度來看， pinning 會產生記憶體碎片化問題，因為 GC 無法移動這些固定物件來壓縮記憶體空間。
+- **Weak handle**（`GCHandleType.Weak`、`GCHandleType.WeakTrackResurrection`）：你告訴 GC「我對這個 object 有興趣，但如果它已經沒人用了，你可以回收它」。Weak handle 不會阻止 GC 回收，但它允許你在 object 被回收後透過 handle 得知這件事（`handle.Target` 會變成 `null`）。`WeakTrackResurrection` 與 `Weak` 的差別在於前者連 finalization 階段也能追蹤。
 
-當 GC 執行時，它會將 pinned 物件周圍已釋放的空間轉換為可用空間。然而，若 pinned 物件被 promoted 到較老的代 (如 gen2)，它們周圍的可用空間也會被視為屬於 gen2 。這些空間因此被 " 鎖定 " 在 gen2 中，只能在 gen2 GC 執行時才能用於容納從 gen1 promote 上來的存活物件。在 gen2 GC 發生前，即使這些空間實際是空閒的，也無法用於分配新物件，造成記憶體使用效率低下。由於 gen2 GC 相對較少發生，這個問題會更加明顯。
+##### 3. 釘選 (Pinning)
 
-為解決這個問題，.NET GC 實現了 demotion（降級）機制。該機制會將某些原本應該 promote 到較老代的 pinned 物件降級回 gen0 。這樣做使得 pinned 物件周圍的空閒空間成為 gen0 的一部分，立即可用於新物件分配，無需等待較老代的 GC 發生。這種方法有效地 " 解鎖 " 了被 pinned 物件鎖住的記憶體空間。
+在 GC 執行 compact（壓縮）階段時，它會把存活的 object 向一端集中搬移，以消除碎片、騰出連續可用空間。但當一個 object 被標記為 **pinned**（通常透過 `GCHandleType.Pinned` 或 `fixed` 關鍵字），GC 就**不能移動它**——這就像一個釘子把 object 釘在原地。
 
-這種降級策略使得在這些空間中分配的物件會消耗 gen0 的預算，但不會增加 gen0 的實際大小，因為它使用的是已有的空間。這有效地改善了 pinning 導致的記憶體碎片化問題，提高了整體記憶體利用效率。通過這種巧妙的機制，.NET GC 在保證 pinned 物件安全的同時，最大限度地減輕了它們對記憶體使用效率的負面影響。
+問題出在 pinned object 的周圍：假設 pinned object 兩側的物件被 GC 回收了，這些釋放出來的空間就變成 pinned object「旁邊」的碎片空洞。如果這個 pinned object 存活夠久而升入 gen2，它旁邊那些空洞也跟著被視為 gen2 的一部分。關鍵在於：**gen2 GC 很少觸發**，因此這些空洞——雖然實際上是空的——在日常的 gen0 / gen1 GC 中都不能拿來分配新 object，形同被「鎖定」在 gen2 中，造成記憶體浪費。
 
-<img src="./images/pinning-demotion.png" alt="Pinning 降級機制流程" style="zoom:80%;" />
+為了解決這個問題，.NET GC 引入了 **demotion（降級）** 機制：它會把某些原本該升入高代的 pinned object 刻意降回 gen0。這麼一來，pinned object 周圍的空閒空間就跟著變成 gen0 的一部分，可以在 gen0 GC 的週期內立即被拿來分配新 object，不再需要苦等 gen2 GC。這有效地「解鎖」了被 pinned object 鎖住的空間。
+
+降級策略有一個巧妙的副作用：在這些回收來的空間中分配新 object，**會消耗 gen0 的 allocation budget（分配預算）但不會增加 gen0 的實際大小**（因為用的是既有空間，不是向 OS 要新記憶體）。這在改善碎片化的同時，也維持了記憶體使用效率。
+
+```mermaid
+flowchart TB
+    A["pinned object 在 gen2"]
+    B["阻擋 GC 壓縮"]
+    C["GC 將 pinned object 降級<br/>到 gen0"]
+    D["周圍 free space 變成 gen0<br/>的一部分"]
+    E["可以更頻繁檢查/回收碎片"]
+    F["gen0 變大, allocation<br/>budget 被吃掉"]
+
+    A --> B --> C --> D
+    D -->|優點| E
+    D -->|代價| F
+
+    style A fill:#e6e6fa,stroke:#9999cc
+    style B fill:#f5f5f5,stroke:#999999
+    style C fill:#e6e6fa,stroke:#9999cc
+    style D fill:#e6e6fa,stroke:#9999cc
+    style E fill:#e6e6fa,stroke:#9999cc
+    style F fill:#e6e6fa,stroke:#9999cc
+```
 
 Fig. 5 - demotion （取自舊投影片，外觀與前圖略有不同）
 
 <img src="./images/demotion.jpg" alt="demotion" style="zoom:80%;" />
 
-當 GC 透過 demotion 機制將 pinned 物件降級到 gen0 時，這些物件周圍的空閒空間也成為 gen0 的一部分。在這些空間中進行的新物件分配會消耗 gen0 的預算，但不會增加 gen0 的實際大小，因為它們使用的是已存在的空間。系統首先嘗試擴展 gen0 以滿足分配需求，只有當 gen0 達到其預算上限且無法再擴展時，才會觸發 gen0 GC。
+前面提到降級後的空間「會消耗 gen0 的 allocation budget 但不會增加 gen0 的實際大小」，這裡補充具體機制：當新 object 在這些回收空間中被分配時，系統會先嘗試擴展 gen0 的可用範圍來滿足需求；只有當 gen0 累積的分配量達到其 budget 上限且無法再擴展時，才會觸發下一次 gen0 GC。換言之，這些空間讓 gen0 能裝更多 object 而不需要立刻觸發 GC，但最終仍受 budget 限制。
 
-然而， GC 並不會無條件地進行降級操作。這是因為讓大量 pinned 物件留在 gen0 中會帶來效能問題：每次 gen0 GC 執行時都需要檢查這些 pinned 物件，增加了 GC 的工作負擔。因此，在 pinning 使用頻繁的情況下， GC 可能選擇不進行降級，這時 gen2 仍可能發生碎片化問題。
+然而，GC **並非無條件**進行降級。原因是每次 gen0 GC 都必須掃描 gen0 中的所有 pinned object，若降級太多 pinned object 到 gen0，等於讓每次高頻的 gen0 GC 都背上沉重的檢查負擔。這是一個取捨：降級能解鎖空間，但過度降級會拖慢 gen0 GC。因此，當 pinned object 數量過多時，GC 會選擇放棄降級，任由碎片留在 gen2 中。
 
-為了減輕 pinning 帶來的 GC 壓力，開發者可以採用兩種關鍵策略。首先是 " 提早 pin"——在堆記憶體已經壓縮的區域進行 pinning，這樣可以避免碎片化問題，因為這些物件已經不需要被移動。其次是 " 批次 pin"——不要零散地分配並 pin 單個物件，而是批次分配緩衝區並一次性 pin 它們。
+開發者可以透過以下策略主動減輕 pinning 對 GC 的壓力：
 
-.NET 5 進一步改進了這方面的支援，引入了 [Pinned Object Heap](https://github.com/dotnet/runtime/blob/master/docs/design/features/PinnedHeap.md) (POH)。 POH 允許開發者在分配物件時就指示 GC 將其放置在專門的 pinned heap 中。這種方法有效緩解了碎片化問題，因為 pinned 物件不再散落在一般堆記憶體中，而是集中在特定區域，大大減少了對整體堆記憶體壓縮的干擾。
+- **提早 pin**：在 Heap 剛完成 compact（壓縮）、尚無碎片時進行 pinning。此時 pinned object 周圍沒有空洞，自然不會產生碎片問題。
+- **批次 pin**：不要零散地逐一分配並 pin 單個 object，而是預先分配一整塊緩衝區，一次性 pin 住整塊區域。這樣 pinned 區域集中，留下的空洞也集中，對 GC 的干擾遠小於四散的小碎片。
 
-##### a. 終結器 (Finalizers)
+> **「批次 pin」具體比喻：** 假設你需要 1000 個 buffer 做網路 IO。若你逐一 `new byte[1024]` 並各自 `fixed`，Heap 上就有 1000 個分散的 pinned object，GC 必須繞過 1000 個「釘子」來 compact，到處都是碎片。反之，你若一次 `new byte[1024 * 1000]` 分配一整塊大 buffer，只在內部用 offset 邏輯切分 1000 個區段，然後只 pin 這一整塊——GC 只需繞過 **一個** 大釘子，compact 的阻礙遠小得多。.NET 中的 `ArrayPool<T>` 就是實踐此策略的現成工具。
+
+.NET 5 進一步改進了這方面的支援，引入了 [Pinned Object Heap](https://github.com/dotnet/runtime/blob/master/docs/design/features/PinnedHeap.md)（POH）。POH 是一個專門用來放置 pinned object 的獨立 Heap；開發者在分配 object 時即可指定將其放入 POH。因為所有 pinned object 集中在專屬區域，不再散落在一般 Heap 中，compact 時就不需要繞過零散的 pinned object，大幅減少了碎片化對 GC 的干擾。
+
+##### 4. 終結器 (Finalizers)
 
 Finalize queue 是另一種 root 來源。若撰寫 .NET 應用一段時間，你可能聽過應避免 finalizers。但有時 finalizers 並非你的程式碼，而是來自使用的函式庫。由於這是 user-facing 功能，需詳細探討。以下是 finalizers 的效能影響：
 
-*Allocation*
+*Allocation（分配階段）*
 
-·    若 allocation  finalizable object (其類型具 finalizer)，在 GC 返回 VM 端的 allocation helper 前，會將此 object 的位址記錄於 finalize queue。
+任何帶有 finalizer 的型別（定義了 `~ClassName()` 的 class），其每個 instance 在 `new` 出來時，GC 都必須將它的位址記錄到 finalize queue 中，作為追蹤清單。這導致兩個後果：
 
-·    finalizer 的存在意味著你無法使用 Fast allocation helpers，因每個 finalizable object 的 allocation 均需向 GC 註冊。
+1. **無法使用 Fast allocation helpers**：一般的 object allocation 可受益於 JIT/VM 的快速分配路徑（例如 Thread-Local Allocation Buffer，簡稱 TLAB），這些路徑不需與 GC 全域同步就能快速從 gen0 劃出空間。但 finalizable object 必須向 GC 註冊，因此繞過了快速路徑，走的是較慢的「須通知 GC」的分配流程。
+
+2. **Allocation 成本通常不高**：除非你的程式絕大多數 object 都是 finalizable（這很少見），否則這部分的額外開銷在實務上不明顯。finalizers 真正的效能殺手在 GC 觸發時——見下節。
 
 ```C#
-public class FastAllocExample
+// 示範：帶 finalizer 的型別
+public class MyResource
 {
-    public void Explain ()
+    ~MyResource()  // 這就是 finalizer
     {
-        // 小 object  allocation (使用 fast alloc)
-        var smallObject = new byte[85]; // 小於 85K
-        
-        // 大 object  allocation (不使用 fast alloc)
-        var largeObject = new byte[85000]; // 大於 85K
-        
-        // Fast alloc helpers 主要優化：
-        // 1. 線程局部 allocation (TLAB)
-        // 2. 小 object 快速 allocation 
-        // 3. 減少同步開銷
+        // 釋放非托管資源，例如 native handle
+        ReleaseNativeHandle();
+    }
+}
+
+// 每次 new 這個型別，GC 都會記錄它
+var resource = new MyResource(); // ← 這個 allocation 不走 fast path
+```
+
+*Collection（收集階段）*
+
+這是 finalizers 對效能衝擊最大的環節。理解關鍵在於：**GC 發現一個 finalizable object 已死亡時，不能直接回收它**——因為它的 finalizer 還未被執行。GC 必須讓這個「已死的 object」繼續存活，以便 finalizer thread 稍後執行 `~MyResource()`。
+
+分代 GC 的連鎖反應如下：
+
+1. 假設一個 finalizable object 在 gen0 GC 時被判定為死亡（已無 root 引用）。
+2. 因為 finalizer 尚未執行，GC 不能回收它，反而必須把它 **promote（提升）** 到 gen1。
+3. 下次 gen1 GC 時，finalizer 可能已執行完畢，該 object 終於可以被回收。
+4. 但若 object 一直存活到 gen2，就必須等到 gen2 GC——最昂貴的 GC——才能回收。
+
+這正是「finalizers 有害」的根本原因：**一個本來可以在 cheap 的 gen0 GC 就回收的 object，因為有 finalizer，硬是被拖到更昂貴的高代 GC 才處理**。Memory 回收被大幅延遲，且每代 GC 掃描時都還要檢查它。
+
+**解法：`GC.SuppressFinalize`**。若你在 dispose 邏輯中已手動釋放資源（例如 `Dispose()` 方法內），應呼叫 `GC.SuppressFinalize(this)`，告知 GC「這個 object 的 finalizer 不用執行了，可以直接回收」。這樣 GC 就不會被強制 promote 它。
+
+```C#
+public class MyResource : IDisposable
+{
+    private bool _disposed = false;
+
+    public void Dispose()
+    {
+        if (!_disposed)
+        {
+            ReleaseNativeHandle();
+            GC.SuppressFinalize(this); // ← 告訴 GC：finalizer 不用跑了
+            _disposed = true;
+        }
+    }
+
+    ~MyResource()
+    {
+        // 只在使用者忘記呼叫 Dispose() 時作為最後防線
+        Dispose();
     }
 }
 ```
 
-然而，此成本通常不明顯，因你不太可能主要 allocation  finalizable object 。更顯著的成本通常來自 GC 實際發生時及 finalizable object 在 GC 中的處理。
+*Running finalizers（執行 finalizer）*
 
-*Collection*
+Finalizer 的實際執行由一個專屬的 **finalizer thread** 負責。前面提過 GC 不能直接回收死掉的 finalizable object——必須先讓 finalizer 執行。具體過程分四步：
 
-GC 發生時，會發現存活 object 並 promote 它們。接著檢查 finalize queue 中的 object 是否被 promoted——若未 promotion，表示 object 已死（儘管無法回收，見下段）。若在收集的 generations 中有大量 finalizable object ，此成本可能顯著。例如，有大量已 promote 至 gen2 的 finalizable object （因持續存活），且頻繁執行 gen2 GC，每次 gen2 GC 均需掃描所有 finalizable object 。若 gen2 GC 極少執行，則無此成本。
+1. GC 掃描時發現某個 finalizable object 已死亡（無 root 引用）→ 不能回收它，相反地，把它和 **它參考的所有子 object** 一起 promote 到高代。這是因為 finalizer 執行時可能需要存取那些子 object，它們必須也保持存活。
 
-此即「 finalizers 有害」的原因——為執行 GC 已判定死亡的 object 的 finalizer，該 object 需存活。由於 GC 是分代的，它將被 promote 至更高 generation，這意味著需更高 generation 的 GC (即更昂貴的 G) 來收集此 object 。因此，若 finalizable object 在 gen1 GC 中被判定死亡，它需等待下次 gen2 GC（可能需時甚久），其 memory 回收將大幅延遲。
+2. GC 將該 object 從一般的 finalize queue 移到一個稱為 **f-reachable queue**（可終結隊列）的專區。移入 f-reachable queue 的 object 代表「finalizer 已就緒，等待執行」。
 
-若使用 `GC.SuppressFinalize` 抑制 finalizer，即告知 GC 無需執行此 object 的 finalizer。因此 GC 無理由 promote 它，將在發現其死亡時回收。
+3. GC 完成後，通知 finalizer thread 有工作待處理。
 
-*Running finalizers*
+4. Finalizer thread 以高優先級逐一從 f-reachable queue 取出 object 並執行 `~Finalize()`。執行完畢後，object 從 f-reachable queue 中移除——此時它才真正變成普通死亡 object，等到下一次涵蓋其所在 generation 的 GC 才會被回收。
 
-由 finalizer Thread 處理。 GC 發現死亡且 finalizable 的 object (後被 promote) 後，將其移至 finalize queue 中供 finalizer Thread 索取並執行的部分，並通知 finalizer Thread 有工作待處理。 GC 完成後， finalizer Thread 將執行這些 finalizers。移至 finalize queue 此部分的 object 稱為「 ready for finalization」。你可能在工具中見過此術語，例如 SoS 的 !finalizequeue 指令顯示：
+你可以在 SoS 除錯器中用 `!finalizequeue` 查看狀態，正常情況下會看到：
 
-`Ready for finalization 0 objects (000002E092FD9920->000002E092FD9920)`
+`Ready for finalization 0 objects`
 
-常見此數值為 0 ，因 finalizer Thread 以高優先級執行， finalizers 會迅速執行（除非被阻塞）。
+「Ready for finalization」就是 f-reachable queue 中等待執行的數量。通常為 0，因為 finalizer thread 優先級高、消化速度快——除非 finalizer 內部做了阻塞操作（例如同步 IO 或 lock 等待），那就會堆積。
 
-下圖展示兩個 object 及 finalizable object  F 的演變。如圖所示， F 被 promoted 至 gen1 後，若發生 gen0 GC，因 gen1 未被收集， F 仍存活； F 僅在 gen1 GC 中（檢查其所在 generation）才真正死亡。
+以下兩個流程圖總結 finalizable object 從出生到真正回收的完整生命週期：
 
-<img src="./images/finalizer-lifecycle.png" alt="Finalizer 生命週期三階段" style="zoom:80%;" />
+```mermaid
+flowchart TB
+    subgraph P1["Phase 1: Allocation"]
+        direction LR
+        A1["new FinalizableObject()"] --> A2["註冊到 finalize queue"] --> A3["失去 fast allocation helper"]
+    end
 
-圖 6 - O 為非 finalizable， F 為 finalizable
+    subgraph P2["Phase 2: Collection"]
+        direction LR
+        B1["GC 發現 object 死亡"] --> B2["移到 f-reachable queue"] --> B3["promote 到 gen1/gen2 + 所<br/>有 referenced objects"]
+    end
 
- <img src="./images/finalize.jpg" alt="finalization" style="zoom:80%;" />
+    subgraph P3["Phase 3: Running"]
+        direction LR
+        C1["finalizer thread 執行<br/>~Finalize()"] --> C2["object 從 f-reachable 移除"] --> C3["下次 GC 才能真正回收"]
+    end
 
-###### 3. Managed Memory Leaks
+    P1 --> P2 --> P3
 
-了解不同類型的 roots 後，可定義 managed memory leak：
+    style P1 fill:#ffffcc,stroke:#cccc00
+    style P2 fill:#ffffcc,stroke:#cccc00
+    style P3 fill:#ffffcc,stroke:#cccc00
+    style A1 fill:#e6e6fa,stroke:#9999cc
+    style A2 fill:#e6e6fa,stroke:#9999cc
+    style A3 fill:#e6e6fa,stroke:#9999cc
+    style B1 fill:#e6e6fa,stroke:#9999cc
+    style B2 fill:#e6e6fa,stroke:#9999cc
+    style B3 fill:#e6e6fa,stroke:#9999cc
+    style C1 fill:#e6e6fa,stroke:#9999cc
+    style C2 fill:#e6e6fa,stroke:#9999cc
+    style C3 fill:#e6e6fa,stroke:#9999cc
+```
 
-`Managed memory leak 表示 process 運行時，至少有一個 user root 直接或間接引用愈來愈多 object 。此為 leak，因 GC 依定義無法回收這些 object 的 memory ，即使盡力執行 Full blocking GC，heap 大小仍持續增長`
+```mermaid
+flowchart TB
+    A["O（普通）和 F（finalizable）<br/>都在 gen0"]
+    B["gen0 GC：O 死亡→被回收<br/>F 死亡但 finalizer 未執行<br/>→ promote 到 gen1"]
+    C["finalizer thread 執行<br/>F.~Finalize() 完畢<br/>F 在 gen1，無引用"]
+    D["gen0 GC<br/>（gen1 不被收集）<br/>F 仍在 gen1"]
+    E["gen1 或 gen2 GC<br/>F 終於可被回收"]
 
-注意此處指「 user root」，表示 gen2 object 持有 gen0 或 gen1 object 不算 leak。因此，判斷是否發生 managed memory leak 的最準確方式，是在 gen2 GC 後檢查 heap——此時僅存的 object 是因 user roots 而存活。最簡單的方式（若可行）是在已知 memory 使用應相同的時點（例如每個請求結束時）強制 Full blocking GC，並驗證 heap 大小未增長。顯然，這僅是協助調查 leak 的方法——生產環境中通常不願強制 Full blocking GC。因此需退而求其次，觀察自然觸發的 gen2 GC 時的 heap。最佳方式是 [ 擷取 top-level GC 追蹤 ](#How-to-collect-top-level-GC-metrics)，查看 gen2 GC 的 promoted bytes，此數值表示因 user roots 而存活的 memory 量。
+    A -->|gen0 GC| B
+    B -->|"GC 結束後"| C
+    C -->|gen0 GC| D
+    C -->|gen1 or gen2 GC| E
 
-這也意味著 [ 碎片化 ](#fragmentation-free-objects-is-part-of-the-heap-size) 並非 managed memory leak 的指標，因碎片化是 free objects 佔據的空間，而設計上它們無 roots。
+    style A fill:#f0f0f0,stroke:#999999
+    style B fill:#f0f0f0,stroke:#999999
+    style C fill:#f0f0f0,stroke:#999999
+    style D fill:#f0f0f0,stroke:#999999
+    style E fill:#f0f0f0,stroke:#999999
+```
+
+##### 5. Managed Memory Leaks
+
+了解不同類型的 roots 後，就可以精確定義什麼是 managed memory leak：
+
+> **Managed memory leak**：process 運行期間，至少有一個 **user root**（stack 變數、static 欄位、GC handle 等）直接或間接地引用了**愈來愈多**的 object。之所以稱為 leak，是因為這些 object 源自 user root——GC 永遠不會回收從 root 可達的 object，因此即使你執行 Full blocking GC，Heap 大小仍會持續增長。
+
+這裡有兩個關鍵細節：
+
+1. **只有「user root」造成的才算 leak**。gen2 object 引用 gen0 或 gen1 object 不是 leak——那是正常的跨代引用，GC 內部自己會管理。但若你的 `static List<object>` 永遠只增不減，那就是典型的 managed memory leak。
+
+2. **判斷 leak 最準確的時機是 gen2 GC 之後**。因為 Full GC 掃過所有 generation，此時還留在 Heap 上的 object，一定是從某個 user root 可達的。若 gen2 GC 後 Heap 大小持續攀升，就表示 user root 握著的 object 越來越多。
+
+*如何檢查：*
+
+- **開發/測試環境**：在已知 memory 用量應相同的時點（例如每個請求處理完畢後）強制執行 `GC.Collect()`（Full blocking GC），觀察 Heap 大小是否持續增長。
+- **生產環境**：生產中不適合強制 Full GC。替代方案是觀察**自然觸發的 gen2 GC** 時的 Heap 狀態。最佳做法為[擷取 top-level GC 追蹤](#How-to-collect-top-level-GC-metrics)，查看 gen2 GC 的 **promoted bytes**——此數值代表因 user roots 而存活下來的 memory 量，若持續上升就是 leak 的訊號。
+
+最後，**碎片化（fragmentation）不是 managed memory leak 的指標**。碎片化是 Heap 中已被 GC 回收、但尚未被壓縮合併的 free space——這些空間本來就沒有任何 root 引用，本質上不是「洩漏」，只是「閒置未用」。
 
 #### e. 主流 GC 場景 vs 非主流場景
 
-| 場景 | 特徵 | GC 最佳化程度 |
+.NET GC 經過數十年調校，其最佳化路徑是圍繞一個最基本的使用模式設計的：程式主要用 stack 變數和 heap object，沒有 finalizer、GC handle、pinning 等特殊機制。這就是所謂的 **Mainline GC scenario**（主流場景）——也是大多數 GC 學術論文唯一討論的情境。
+
+| 場景 | 典型特徵 | GC 最佳化程度 |
 |------|------|--------------|
-| **Mainline** | 只用 stack + heap objects, 無 finalizers/GC handles | 高度最佳化 |
-| **Non-Mainline** | 大量 GC handles, finalizers, pinned objects | 仍最佳化但假設數量不多 |
+| **Mainline** | 只用 stack + heap objects，無 finalizers / GC handles | 高度最佳化 |
+| **Non-Mainline** | 大量 GC handles、finalizers、pinned objects | 仍有最佳化，但設計假設用量不多 |
 
-如果一個程式僅使用 Stack 並建立一些 objects 來使用， GC 多年來已對此進行了大量最佳化。基本上就是「掃描 heap 以取得根 (root)，並從那裡處理 objects」。這是許多 GC 論文假設的唯一場景，也就是所謂的「 mainline GC scenario」。當然，作為一個存在數十年且需要滿足各種客戶需求的商業產品，我們還有許多其他機制如 GC handles 和 finalizers。關鍵在於，儘管我們也持續最佳化這些機制，但我們的運作基於「這些機制數量不會太多」的假設——顯然這並非適用於所有人。因此，若您有大量這類機制且正在診斷 memory 問題，值得深入檢視。換言之，若沒有 memory 問題則無需在意；但若有 (例如 GC 耗費高 % 時間)，這些是值得懷疑的對象。
+現實中的 .NET 當然需要支援 GC handles 和 finalizers——這是商業產品必須提供的功能。.NET GC 對這些機制也持續做了最佳化，但設計前提是「你不會大量使用它們」。換言之：
 
-> **初學者筆記**：Mainline 場景就像標準高速公路——GC 經過數十年調校，跑得飛快。Non-mainline 機制（finalizers、pinning、大量 GC handles）就像收費站——偶爾遇到沒關係，但如果你的程式大量使用這些機制，GC 就無法以最高速運行，值得深入調查。
+- **如果你沒有 memory 問題**：不用管這些。Mainline 和 Non-Mainline 的路徑在日常用量下都能正常運作。
+- **如果你正在診斷 GC 效能問題**（例如 GC 佔用過高 CPU 時間、pause 過長），且你的程式大量使用了 finalizer、pinning 或 GC handle——這些就是首要調查對象。
+
+> **初學者筆記**：Mainline 場景就像標準高速公路——GC 在上面跑得飛快。Non-Mainline 機制（finalizers、pinning、大量 GC handles）就像收費站——偶爾經過沒關係，但若你的程式布滿收費站，速度自然快不起來。
 
 #### f. GC 暫停中與 GC 無關的部分——Thread 暫停 (Thread Suspension)
 
-我們尚未提及的 GC pause 最後一個部分，是與 GC 工作完全無關的部分——我指的是運行時 (runtime) 中的 Thread 暫停機制。 GC 在開始工作前會呼叫暫停機制，讓 process 中的 Thread 停止。我們稱此為讓 Thread 到達安全點 (safe points)。由於 GC 可能搬移 objects， Thread 不能隨機停止；它們必須停在 runtime 能回報 GC heap objects 參考的位置，以便 GC 必要時更新這些參考。一個常見誤解是 GC 負責暫停——實際上 GC 僅呼叫暫停機制來停止 Thread。但暫停被計入 GC 暫停時間，因為 GC 是使用此機制的主要元件。
+GC Pause 的總時間其實包含兩個不同來源的耗時：
 
-我們討論過 [concurrent vs blocking GC](#Concurrent-GCBackground-GC)，已知 blocking GC 會在 GC 期間持續暫停Thread，而 BGC (concurrent 類型) 僅短暫暫停Thread，並在用戶 Thread 運行時完成大部分 GC 工作。較少人知的是，讓 Thread 進入暫停狀態可能需要時間。多數情況下這非常快速，但緩慢的暫停是 managed  memory 相關效能問題的一類，我們將專門討論 [ 如何診斷這些問題 ](#PerfView-GC-stop-triggers)。
+| 組成 | 誰做的 | 說明 |
+|------|--------|------|
+| **Suspension 時間** | Runtime 的暫停機制 | 讓所有 managed thread 停在 safe point |
+| **GC 工作時間** | GC 本身 | 標記、掃描、compact 等實際回收工作 |
 
-需注意，在 GC 的暫停階段，只有執行 managed 程式碼的 Thread 會被暫停。執行原生程式碼 (native code) 的  Thread 可自由運行。但若它們在暫停階段需返回 managed 程式碼，則必須等待暫停階段結束。
+很多人誤以為「GC 負責暫停 Thread」，這是錯的。GC 在開始工作前，只是**呼叫** Runtime 的暫停機制（說「請幫我把所有 Thread 停下來」），實際執行暫停的是 Runtime。但這段暫停時間仍被計入 GC Pause，因為 GC 是唯一使用此機制的呼叫者。
 
-<img src="./images/thread-suspension-sequence.png" alt="GC暫停時序圖" style="zoom:80%;" />
+Thread 不能隨時隨地被停下來——GC 可能會搬移 object，若某個 Thread 正握著一個 object 的參考，而 GC 把它搬走了，Thread 手上就變成無效指標。因此 Thread 必須停在 **safe point（安全點）**——也就是 Runtime 能完整掌握該 Thread 當下所有 object 參考的位置。Thread 平常在跑的時候會定期檢查「有人叫我暫停嗎？」，收到訊號後跑到下一個 safe point 就停下來。
+
+我們討論過 [concurrent vs blocking GC](#Concurrent-GCBackground-GC)：blocking GC 在整個 GC 期間都暫停 Thread；BGC 僅短暫暫停（讓 Thread 跑到 safe point 後立刻恢復），大部分 GC 工作在 Thread 運行時並行完成。但較少人注意的是一個潛在問題：**讓 Thread 到達 safe point 本身可能需要時間**。大多數情況下這極快（微秒級），但若某個 Thread 正在執行長時間的 native code 呼叫或 JIT 編譯，它可能很久都到不了 safe point——這就會拖累整體暫停時間。我們將在[如何診斷這些問題](#PerfView-GC-stop-triggers)中專門討論。
+
+最後一個細節：GC 暫停階段只暫停**執行 managed 程式碼的 Thread**。正在跑 native code 的 Thread 不受影響、可繼續執行。但若 native code 執行期間需要返回 managed 程式碼（例如 native callback 回 managed），就必須等到暫停結束。
+
+```mermaid
+sequenceDiagram
+    participant T as 你的 Thread
+    participant R as Runtime (Suspension)
+    participant G as GC
+
+    G->>R: 我要開始 GC，幫我停掉全部 Thread
+    R->>T: 發出暫停訊號
+    T->>T: 執行到 Safe Point 後停下
+    Note over T,R: ⏱ Suspension 時間 (計入 GC Pause)
+    R->>G: 全部 Thread 已暫停
+    G->>G: 開始 GC 工作
+    Note over G: ⏱ GC 工作時間
+    G->>R: GC 完成，可以恢復 Thread
+    R->>T: 恢復執行
+```
 
 > **初學者筆記**：常見誤解——大家以為 GC 負責暫停 Thread。其實 GC 只是呼叫 Runtime 的暫停機制（就像叫人幫忙關燈），暫停本身是 Runtime 做的。但暫停時間被計入 GC pause time，因為 GC 是唯一使用這個機制的元件。如果你在 PerfView 等工具中看到 Suspend Msec 佔 GC Pause 的很大比例 → 問題不在 GC，在 Thread 到達 Safe Point 太慢（例如 Thread 正在執行長時間的 native code 呼叫或 JIT 編譯）。
 
@@ -1406,78 +1569,107 @@ GC 發生時，會發現存活 object 並 promote 它們。接著檢查 finalize
 
 ## 1. 頂層應用指標
 
-如前所述，擁有 [perf goals](#Know-what-your-perf-goal-is) 至關重要——這些目標應由一個或多個高階應用程式指標來體現。它們被稱為應用程式指標是因為它們直接反映應用程式的效能面向，例如：處理的並行請求數量、請求延遲的平均值、最大值或 P95 值。
+如前所述，擁有 [perf goals](#Know-what-your-perf-goal-is) 至關重要——這些目標應由一個或多個高階應用程式指標來體現。它們被稱為「應用程式指標」是因為直接反映應用程式的效能面向，例如：處理的並行請求數量、請求延遲的平均值 / 最大值 / P95 值。
 
-使用高階應用程式指標來判斷產品開發過程中是否出現效能衰退或改進相對容易理解，因此我們不在此多作說明。但值得指出的是，有時這些指標可能難以保持足夠穩定以觀察月度趨勢甚至每日趨勢，原因單純是工作負載並非每日恆定，尤其是尾部延遲 (tail latency) measure。如何解決此問題？
+使用這類指標來判斷產品開發過程中是否出現效能衰退或改進相對直覺，因此此處不展開。但有一個容易被忽略的困難：**工作負載本身每天都在變**（尖峰流量不同、請求類型比例不同），這導致應用指標也跟著波動，很難穩定地看出月度甚至每日的趨勢——尾部延遲（tail latency）尤其敏感。
 
-·    這正是需要measure可能影響效能指標的 [factors](#Measure-the-impact-of-factors-that-likely-affect-your-perf-metrics) 的重要原因之一。當然，您很可能無法事先掌握所有因素。隨著認知增加，可將它們加入需measure的項目清單。
+如何解決？兩個方向：
 
-·    建立有助判斷工作負載變異程度的高階組件指標。對 memory 而言，一個簡單指標是完成的 allocation 量。若今日尖峰時段的 allocation 量是昨日的兩倍，即可推斷今日工作負載可能對 GC 造成更大壓力 (allocation 絕對不是影響 GC 暫停的唯一因素，請參閱上方 [GC Pauses](#Understanding-GC-pauses-ie-when-GCs-are-triggered-and-how-long-a-GC-lasts) 章節)。但此指標廣受追蹤的原因之一，在於它直接關聯用戶程式碼——您可在程式碼行中看到 allocation 發生時機，而將 GC 與程式碼行直接關聯則困難許多。
+1. **Measure 影響效能指標的 [factors](#Measure-the-impact-of-factors-that-likely-affect-your-perf-metrics)**。你不一定一開始就掌握所有影響因素，但隨著對系統理解的加深，可以逐步擴充追蹤清單。例如同時記錄當下的流量類型、資料量大小等背景變數，後續分析時才能區分「是真的變慢」還是「工作量變大」。
+
+2. **建立高階組件指標，用來判斷工作負載的變異程度**。對 memory 來說，一個簡單實用的指標是 **完成的 allocation 量**（allocated bytes）。例如：若今天尖峰時段的 allocation 量是昨日的兩倍，你就能合理推斷今天 GC 面臨的壓力更大——這有助於解釋為何 GC 指標今天看起來特別差。（allocation 量當然不是影響 GC 暫停的唯一因素，詳見上方 [GC Pauses](#Understanding-GC-pauses-ie-when-GCs-are-triggered-and-how-long-a-GC-lasts) 章節。）
+
+Allocation 量之所以被廣泛追蹤，還有另一個原因：它與用戶程式碼有**直接對應關係**——你可以在程式碼中清楚看到 `new` 發生在哪一行。相比之下，要將某次 GC 暫停直接關聯到具體的程式碼行，困難得多。因此 allocation 量常作為 memory 分析的「第一站」——先看誰在大量分配，再往下追 GC 行為。
 
 ## 2. 頂層 GC 指標
 
-既然您閱讀此文件，顯然關心的組件之一就是 GC。那麼應該追蹤哪些高階 GC 指標？又該如何判斷何時需擔憂？
+既然你在閱讀這份文件，顯然 GC 是你關心的組件之一。那麼該追蹤哪些高階 GC 指標？又該如何判斷何時需要擔心？
 
-我們提供多種可measure的 GC 指標——顯然您無需全數關注。事實上，要判定是否 / 何時該開始關注 GC，只需一兩個高階 GC 指標即可。表 3 根據您的效能目標列出相關的高階 GC 指標。收集方法將在 [later section](#How-to-collect-top-level-GC-metrics) 說明。
+我們提供多種可量測的 GC 指標——你不需要全數監控。事實上，只需一兩個高階 GC 指標就能判斷是否該開始關注 GC。下表根據你的效能目標，列出最相關的指標（收集方法將在[後續章節](#How-to-collect-top-level-GC-metrics)說明）：
 
-Table 3
+| 你的效能目標 | 最該看的 GC 指標 | 為什麼 |
+|-------------|-----------------|--------|
+| **吞吐量 (Throughput)** | `% Pause time in GC`（Thread 被 GC 暫停的時間比例） | 你的 Thread 被暫停愈少，吞吐量愈高。若使用 BGC，可搭配看 `% CPU time in GC` 確認 CPU 競爭狀況 |
+| **尾部延遲 (Tail latency)** | 個別 GC 暫停（Individual GC Pauses） | P95/P99 延遲的峰值往往與單次長時間 GC 重疊——找出那幾次特別久的暫停就是關鍵 |
+| **Memory 佔用量 (Memory footprint)** | GC Heap 大小直方圖（histogram） | 觀察 Heap 大小在不同時段的分布，判斷是否持續增長或穩定在預期範圍內 |
 
-| **應用程式效能目標** | **相關 GC 指標**                           |
-| ------------------------- | ------------------------------------------------- |
-| 吞吐量 (Throughput)                | GC 中的 % 暫停時間 (可能包含 GC 中的 %CPU 時間) |
-| 尾部延遲 (Tail latency)              | 個別 GC 暫停                              |
-|  memory 佔用量 (Memory footprint)         | GC heap 大小直方圖 (histogram)                           |
+下表是上述各指標以及幾個輔助指標的詳細解釋，幫助你理解每個數字在實務上的意義及判斷基準：
 
-以下為各指標的初學者白話解釋，幫助你理解每個指標在實務上代表什麼意義，以及如何判斷好壞：
-
-| 指標 | 白話解釋 | 好/壞的判斷 |
-|------|---------|-----------|
-| % Pause time in GC | 你的 Thread 有多少比例的時間被 GC 暫停，無法處理使用者請求 | `<5%` 通常可接受；`>20%` 需要調查；介於中間則取決於你的延遲目標 |
-| % CPU time in GC | GC Thread 吃掉多少 CPU 資源 | 需結合 `% Pause time in GC` 和 BGC 比例一起看；BGC 用 CPU 換取短暫停是正常取捨 |
-| Max GC Heap Size | GC heap 在歷史上的最大大小 | 需對比 process 總 memory 使用量，判斷 GC heap 是否為 memory 的主要消費者 |
-| Individual GC Pauses | 單次 GC 最長暫停多久 | 直接影響 tail latency（P95/P99 延遲）；若超出 SLA 則需檢查對應的 GC generation |
-| Physical Memory Usage | process 的總 memory 使用量 | 需區分 GC heap vs 非 GC heap（如 native memory、thread stacks、loaded libraries），才能判斷問題根源 |
-| GC Frequency | 各代 GC 觸發次數 | gen0 GC 頻繁是正常現象（表示大量短命 object 被快速回收）；gen2 GC 頻繁則需注意（可能暗示 managed memory leak 或 heap 持續增長） |
+| 指標 | 一句話解釋 | 判斷好壞的參考 |
+|------|-----------|--------------|
+| `% Pause time in GC` | Thread 有多少比例的時間被 GC 凍結，無法處理使用者請求 | `< 5%` 通常可接受；`> 20%` 需要調查；5%~20% 之間則取決於你的延遲目標 |
+| `% CPU time in GC` | GC Thread 佔用多少 CPU 資源 | 需搭配 `% Pause time in GC` 和 BGC 比例一起看——BGC 本質上是用更多 CPU 換取更短暫停，這是合理的取捨 |
+| Individual GC Pauses | 單次 GC 的暫停時間（通常關注最長的那幾次） | 直接影響 tail latency（P95/P99）；若超出 SLA 對應的延遲上限，檢查該次 GC 是哪一代觸發的 |
+| Max GC Heap Size | GC Heap 在歷史上的峰值大小 | 需與 process 總 memory 用量對比，才能判斷 GC Heap 是否為 memory 的主要開銷來源 |
+| Physical Memory Usage | Process 的總 memory 使用量（含 GC Heap + 其他） | 區分 GC Heap vs 非 GC Heap（native memory、thread stacks、loaded libraries），才能精確定位 memory 瓶頸 |
+| GC Frequency | 各代 GC 的觸發次數 | gen0 GC 頻繁是正常現象（表示大量短命 object 被快速回收）；gen2 GC 頻繁則需警惕（可能暗示 managed memory leak 或 Heap 持續增長） |
 
 ## 3. 何時需要擔心 GC
 
-如果你理解 [GC 基礎知識 ](#GC-Fundamentals)，應該非常清楚 GC 行為是由應用程式行為驅動的。頂層應用程式指標應該告訴你何時存在效能問題。而 GC 指標有助於你調查這些效能問題。例如，如果你知道工作負載在一天中的長時間段處於休眠狀態，那麼查看 "% Pause time in GC" 指標的日平均值就沒有意義，因為 "% Pause time in GC" 的平均值會非常小。更合理的方式是查看這些 GC 指標時問「我們在 X 點左右發生了中斷，查看該時段的 GC 指標以確認 GC 是否可能是原因」。
+回顧 [GC 基礎知識](#GC-Fundamentals) 的核心觀念：**GC 的行為由你的應用程式行為驅動**。這意味著兩件事：
 
-當相關 GC 指標顯示 GC 影響很小時，將精力集中在其他方面會更有效。*如果指標顯示 GC 確實有重大影響，此時你應該開始擔心如何進行受控 memory 分析*，這也是本文檔的主要內容。
+- **應用程式指標**（請求數、延遲等）告訴你「何時」出現效能問題。
+- **GC 指標**（% Pause time、GC 次數等）幫助你「調查」這些問題是否與 GC 有關。
 
-讓我們詳細檢視每個目標，以理解為何需要查看其對應的 GC 指標——
+舉一個常見的誤用：假設你的應用白天滿載、深夜幾乎休眠。此時看 `% Pause time in GC` 的「全日平均值」沒有意義——深夜的零暫停會把平均值拉到很低，掩蓋白天的真實狀況。正確做法是：**鎖定問題發生的時間區段**（例如「下午兩點左右延遲突然飆高」），只查看該時段的 GC 指標，判斷 GC 是否為造成中斷的原因。
+
+根據 GC 指標的結果，決策很明確：
+
+- **GC 影響很小**（例如 % Pause time < 5%）→ 瓶頸不在 GC，把精力放在其他方面更有效。
+- **GC 確實有重大影響**（例如 % Pause time > 20%，或單次暫停超出 SLA）→ 你需要進行受控的 memory 分析——這正是本文檔後續章節的主要內容。
+
+以下逐一檢視三個效能目標，說明為何各自對應那些 GC 指標——
+
+---
 
 **吞吐量** 
 
-要提升吞吐量，你希望 GC 盡可能少地中斷你的 Thread。 GC 會以兩種方式干擾 -
+要提升吞吐量，你希望 GC 盡可能少地中斷你的 Thread。GC 以兩種方式影響吞吐量：
 
-· GC 可以暫停你的 Thread —— blocking GC 會在整個 GC 期間暫停它們，而 BGC 會短暫暫停。此暫停由 "% Pause time in GC" 表示。
+- **暫停你的 Thread**：blocking GC 在整個 GC 期間凍結所有 managed thread；BGC 僅短暫凍結。這個影響由 `% Pause time in GC` 衡量。
+- **消耗 CPU**：GC thread 本身需要 CPU 來做標記、掃描等工作。BGC 雖然不大幅暫停 thread，但它的 GC thread 會和你的應用 thread 競爭 CPU。這個影響由 `% CPU time in GC` 衡量。
 
-· GC Thread 會消耗 CPU 進行工作，雖然 BGC 不會大幅暫停你的 Thread，但它會與你的 Thread 競爭 CPU。因此還有另一個指標稱為 "% CPU time in GC"。
+`% Pause time in GC` 的計算非常直覺：
 
-這兩個數字可能差異很大。"% Pause time in GC" 的計算方式為：
+```
+% Pause time in GC = Thread 被 GC 暫停的累積時間 / Process 總經過時間
+```
 
-`Thread 被 GC 暫停的經過時間 / process 的總經過時間`
+例如：process 啟動後過了 10 秒，其中 thread 因 GC 累積暫停了 1 秒 → `% Pause time in GC` = 10%。
 
-因此，如果 process 啟動後經過 10 秒，且 Thread 因 GC 暫停了 1 秒，則 "% Pause time in GC" 為 10%。
+`% CPU time in GC` 則比較容易誤解，需要特別說明。關鍵觀念是：**當 GC 已經把你的 thread 凍結時，你反而希望 GC 用滿所有 CPU 核心**——這樣 GC 才能最快完成、最快釋放你的 thread。GC 暫停期間看到 100% CPU 不是 bug，是設計意圖。
 
-"% CPU time in GC" 可能大於或小於 "% Pause time in GC"，即使不考慮 BGC，因為它取決於 process 中其他事物如何使用 CPU。當 GC 進行時，我們希望它盡快完成；因此我們希望在其執行期間看到盡可能高的 CPU 使用率。這曾是一個非常令人困惑的概念，但現今似乎較少發生。我曾收到擔憂的報告稱「當我看到 [Server GC](#Server-GC) 時，它使用了 100% 的 CPU！我需要減少這個！」。我向他們解釋這實際上正是我們希望看到的 —— 當 GC 暫停了你的  Thread 時，我們希望使用所有可用的 CPU 以便更快完成 GC 工作。假設 "% Pause time in GC" 為 10%，且在 GC 暫停期間達到了 100% CPU 使用率（例如，如果你有 8 核心， GC 完全使用了所有 8 核心），而在 GC 之外你的 Thread 達到 50% CPU 使用率，且沒有發生 BGC (意味著 GC 僅在Thread 暫停時工作)，則 "% CPU time in GC" 為：
+因此，`% CPU time in GC` 的數值取決於兩個變數：GC 佔用 CPU 的比例，以及非 GC 期間你的應用本身用了多少 CPU。公式為：
 
-`(100% * 10%) / (100% * 10% + 50% * 90%) = 18%`
+```
+% CPU time in GC = (GC期間CPU% × Pause%) / (GC期間CPU% × Pause% + 非GC期間CPU% × 非Pause%)
+```
 
-我建議先監控 "% Pause time in GC"，因為監控成本低且是判斷是否需關注 GC 的頂層指標。監控 "% CPU time in GC" 成本更高 (需要實際收集 CPU 樣本)，通常除非你的應用進行大量 BGC 且 CPU 確實飽和，否則不那麼關鍵。
+具體例子：假設 `% Pause time in GC` = 10%，GC 暫停期間用滿全部 8 核心（100% CPU），非 GC 期間你的應用平均用 50% CPU，且沒有 BGC（GC 只在暫停期間工作）：
 
-通常行為良好的應用在主動處理工作負載時， GC 暫停時間 < 5%。如果你的應用為 3%，即使你能減少一半（這將很困難），也不會大幅提升整體效能。
+```
+(100% × 10%) / (100% × 10% + 50% × 90%) = 10% / (10% + 45%) = 10/55 ≈ 18%
+```
+
+這個 18% 不代表 GC 在搶你的 CPU——它只是反映了 GC 在它該工作的 10% 時間內全力以赴的結果。
+
+**實務建議：** 優先監控 `% Pause time in GC`，因為它成本最低（只需計算暫停時間比例），且是判斷 GC 是否值得關注的一級指標。`% CPU time in GC` 需要實際收集 CPU 樣本，成本較高，通常只在你的應用大量使用 BGC 且 CPU 確實吃緊時才需要追蹤。
+
+一般來說，行為良好的應用在主動處理工作負載時，`% Pause time in GC` 應 < 5%。如果你的數字已經是 3%，即使費盡心力砍到 1.5%（非常困難），對整體吞吐量的提升也極其有限——這時候把精力放在其他瓶頸上更划算。
+
+---
 
 **尾延遲 (Tail latency)**
 
-[ 先前 ](#Measure-the-impact-of-factors-that-likely-affect-your-perf-metrics) 我們討論了如何思考影響尾延遲的因素。如果尾延遲是你的目標，除了其他因素， GC 或最長 GC 可能發生在那些最長的請求期間。因此measure這些單個 GC 暫停以查看它們對延遲的貢獻程度很重要。[ 本文後續 ](#GC-event-sequence) 將介紹輕量級方法來得知單個 GC 暫停的開始和結束。
+[先前](#Measure-the-impact-of-factors-that-likely-affect-your-perf-metrics)我們討論過影響尾延遲的各種因素。如果你的目標是降低 P95 / P99 延遲，GC 是其中一個可能的嫌疑人：**最長的那幾次請求，往往正好碰上最長的那幾次 GC 暫停**。因此，你需要追蹤每次 GC 暫停的個別時間，來判斷 GC 對尾延遲的貢獻有多大。[本文後續](#GC-event-sequence)會介紹如何用輕量級方法取得單次 GC 暫停的開始與結束時間。
 
-如果你的目標是減少特定百分位的延遲，關注不影響那些請求的單個暫停是無效的，因為減少它們不會改變該百分位。例如，如果你當前的目標是減少約 50ms 的 P95 延遲，它們不受耗時 100ms 的 GC 影響。當然，消除這些 100ms 的 GC (可能影響 P99 延) 是好的，但對當前任務無幫助。
+一個重要的務實提醒：**只關注影響你目標百分位的 GC 暫停**。例如你的目標是降低 P95 延遲（約 50ms），但你發現有些 GC 暫停長達 100ms——這些 100ms 的暫停雖然會傷害 P99，但對 P95 沒有影響（P95 的請求根本沒遇到它們）。去優化這些 100ms 的暫停當然是好事，但對你當前的 P95 目標沒有幫助。先解決與目標百分位直接相關的 GC，剩下的再排優先級。
 
-** memory 佔用**
+---
 
-如果你尚未閱讀 [GC heap size vs process memory size](#GC-heap-is-only-one-kind-of-memory-usage-in-your-process) 及如何正確 [ measure GC heap size](#How-to-look-at-the-GC-heap-size-properly)，我強烈建議現在閱讀。實際上， managed process 常有顯著甚至大量的 memory 使用 (除 GC heap 外)，因此理解是否屬於此情況很重要。如果 GC heap 僅佔 process 總 memory 使用的一小部分，專注於減少 GC heap 大小就沒有意義。
+**Memory 佔用**
+
+如果你還沒有讀過 [GC heap size vs process memory size](#GC-heap-is-only-one-kind-of-memory-usage-in-your-process) 和[如何正確量測 GC heap 大小](#How-to-look-at-the-GC-heap-size-properly)，強烈建議先閱讀這兩節。核心觀念是：**GC Heap 只是 process 中眾多 memory 消費者之一**。一個 managed process 的總 memory 用量除了 GC Heap，還包含 native memory、thread stacks、loaded libraries、JIT 編譯後的程式碼等。如果你的 GC Heap 只佔 process 總 memory 的一小部分，你花再多力氣縮減 GC Heap 也對整體 memory 佔用沒有顯著幫助——這時應該去查其他 memory 消費者。
 
 # 七、選擇正確工具並解讀數據
 
